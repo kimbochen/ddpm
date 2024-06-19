@@ -1,23 +1,22 @@
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from dataclasses import dataclass, asdict, field
-
-import torch
-import torch.nn.functional as F
-import torchvision.transforms as T
-from torch import nn
-from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR10, FashionMNIST
-from tqdm import tqdm
-
-from model import UNet
 
 import numpy as np
+import ffcv.transforms as T
 from ffcv.fields import RGBImageField
 from ffcv.fields.decoders import SimpleRGBImageDecoder
 from ffcv.loader import Loader, OrderOption
-from ffcv.transforms import ToTensor, ToTorchImage, ToDevice, NormalizeImage, RandomHorizontalFlip, Convert
 from ffcv.writer import DatasetWriter
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader
+from torchvision.datasets import CIFAR10
+from torchvision.utils import make_grid, save_image
+from tqdm import tqdm
+
+from model import UNet
 
 
 class DDPM(nn.Module):
@@ -76,129 +75,65 @@ class TrainerConfig:
     nw: int = 16
     lr: float = 2e-4
     n_epochs: int = 500
-    ckpt_name: str = 'cifar10'
+    ckpt_name: str = 'cifar10_fp16_ffcv'
 
 
-def train(
-    nT, beta_s, beta_e, img_dim, n_channels,
-    ds, bs, nw, device, lr, n_epochs, ckpt_name
-):
-    dataloader = DataLoader(ds, batch_size=bs, num_workers=nw, drop_last=True)
-    ddpm = torch.compile(DDPM(nT, beta_s, beta_e, img_dim, n_channels).to(device))
-    optimizer = AdamW(ddpm.parameters(), lr=lr)
+def main():
+    cfg_m = ModelConfig()
+    cfg_t = TrainerConfig()
+
+    ddpm = torch.compile(DDPM(**asdict(cfg_m)).to(cfg_t.device))
+    optimizer = torch.optim.AdamW(ddpm.parameters(), lr=cfg_t.lr)
     scaler = torch.cuda.amp.GradScaler()
 
-    ddpm.train()
-
-    for epoch in range(n_epochs):
-        for x0, _ in (pbar := tqdm(dataloader)):
-            optimizer.zero_grad()
-
-            x0 = x0.to(device)
-            eps = torch.randn_like(x0)
-            t = torch.randint(0, nT, [bs], device=device)
-            # eps_pred = ddpm(x0, eps, t)
-        
-            # loss = F.smooth_l1_loss(eps, eps_pred)
-            # loss.backward()
-            # optimizer.step()
-
-            # pbar.set_description(f'{loss=:.4f}')
-
-            with torch.cuda.amp.autocast():
-                eps_pred = ddpm(x0, eps, t)
-                loss = F.smooth_l1_loss(eps, eps_pred)
-        
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        
-            pbar.set_description(f'loss={loss.item():.4f}')
-
-    torch.save(ddpm.state_dict(), f'./ddpm_{ckpt_name}.pth')
-
-
-def train_cifar10_ffcv_main():
     if not Path('./cifar10.beton').exists():
-	    ds = CIFAR10('./cifar10', train=True, download=True)
-	    writer = DatasetWriter('./cifar10.beton', {'image': RGBImageField(max_resolution=32)})
-	    writer.from_indexed_dataset(ds)
-    cfg_m = ModelConfig()
-    cfg_t = TrainerConfig(ckpt_name='cifar10_fp16_ffcv')
-    train_cifar10_ffcv(**asdict(cfg_m), **asdict(cfg_t))
-
-def train_cifar10_ffcv(
-    nT, beta_s, beta_e, img_dim, n_channels,
-    bs, nw, device, lr, n_epochs, ckpt_name
-):
+        ds = CIFAR10('./cifar10', train=True, download=True)
+        writer = DatasetWriter('./cifar10.beton', {'image': RGBImageField(max_resolution=32)})
+        writer.from_indexed_dataset(ds)
     img_tsfms = [
         SimpleRGBImageDecoder(),
-        RandomHorizontalFlip(),
-        ToTensor(),
-        ToDevice(torch.device(device)),
-        ToTorchImage(),
-        NormalizeImage(
-            mean=np.array([127.5, 127.5, 127.5]), std=np.array([127.5, 127.5, 127.5]),  # [0, 255] -> [-1, 1]
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+        T.ToDevice(torch.device(cfg_t.device)),
+        T.ToTorchImage(),
+        T.NormalizeImage(  # [0, 255] -> [-1, 1]
+            mean=np.array([127.5, 127.5, 127.5]),
+            std=np.array([127.5, 127.5, 127.5]),
             type=np.float32
         )
     ]
     dataloader = Loader(
-        './cifar10.beton', batch_size=bs, num_workers=nw, drop_last=True, os_cache=True,
+        './cifar10.beton', batch_size=cfg_t.bs, num_workers=cfg_t.nw, drop_last=True, os_cache=True,
         order=OrderOption.RANDOM, pipelines={'image': img_tsfms}
     )
-    ddpm = torch.compile(DDPM(nT, beta_s, beta_e, img_dim, n_channels).to(device))
-    optimizer = AdamW(ddpm.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler()
 
-    ddpm.train()
-
-    for epoch in range(n_epochs):
+    for epoch in range(cfg_t.n_epochs):
+        ddpm.train()
         for x0, in (pbar := tqdm(dataloader)):
             optimizer.zero_grad()
 
             eps = torch.randn_like(x0)
-            t = torch.randint(0, nT, [bs], device=device)
+            t = torch.randint(0, cfg_m.nT, [cfg_t.bs], device=cfg_t.device)
 
             with torch.cuda.amp.autocast():
                 eps_pred = ddpm(x0, eps, t)
                 loss = F.smooth_l1_loss(eps, eps_pred)
-        
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-        
+
             pbar.set_description(f'loss={loss.item():.4f}')
 
-    torch.save(ddpm.state_dict(), f'./ddpm_{ckpt_name}.pth')
+        if epoch == cfg_t.n_epochs - 1 or (epoch + 1) % (cfg_t.n_epochs // 10) == 0:
+            ddpm.eval()
+            xs = ddpm.sample(16)
+            grid = make_grid(xs, nrow=4, normalize=True)
+            save_image(grid, f'ddpm_samples/ddpm_sample_epoch{epoch}.png')
 
-
-
-def train_cifar10():
-    img2tensor = T.Compose([
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(mean=0.5, std=0.5)  # [0, 1] -> [-1, 1]
-    ])
-    ds = CIFAR10('./cifar10', train=True, transform=img2tensor, download=True)
-    cfg_m = ModelConfig()
-    cfg_t = TrainerConfig(ckpt_name='cifar10_fp16')
-    train(ds=ds, **asdict(cfg_m), **asdict(cfg_t))
-
-
-def train_fashion_mnist():
-    img2tensor = T.Compose([
-        T.Resize(32),
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(mean=0.5, std=0.5)
-    ])
-    ds = FashionMNIST('./mnist', train=True, transform=img2tensor, download=True)
-    cfg_m = ModelConfig(n_channels=1)
-    cfg_t = TrainerConfig(n_epochs=30, ckpt_name='fashion_mnist_fp16')
-    train(ds=ds, **asdict(cfg_m), **asdict(cfg_t))
+    torch.save(ddpm.state_dict(), f'./ddpm_{cfg_t.ckpt_name}.pth')
 
 
 if __name__ == '__main__':
     torch.manual_seed(3985)
-    # train_cifar10_ffcv_main()
-    train_fashion_mnist()
+    main()
