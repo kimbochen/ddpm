@@ -5,6 +5,7 @@ A PyTorch implementation of the original DDPM, with a focus on improving trainin
 ![](ddpm_samples/ddpm_sample_epoch499.png)
 > DDPM trained on CIFAR10
 
+
 ## Setup
 
 Install PyTorch with version 2+ and FFCV.  
@@ -14,6 +15,13 @@ To install FFCV without using Conda:
 sudo apt install libopencv-dev libturbojpeg-dev
 pip install -r requirements.txt
 ```
+
+To train the model:
+```bash
+python ddpm.py
+```
+
+Configurations are in `ddpm.py`, specified by 2 classes: `ModelConfig` and `TrainerConfig`.
 
 
 ## Performance Optimizations
